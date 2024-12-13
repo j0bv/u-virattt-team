@@ -5,9 +5,10 @@ import pandas as pd
 
 from src.tools import get_price_data
 from src.agents import run_hedge_fund
+from src.execution import OrderExecutor
 
 class Backtester:
-    def __init__(self, agent, ticker, start_date, end_date, initial_capital):
+    def __init__(self, agent, ticker, start_date, end_date, initial_capital, paper_trading=True):
         self.agent = agent
         self.ticker = ticker
         self.start_date = start_date
@@ -15,6 +16,7 @@ class Backtester:
         self.initial_capital = initial_capital
         self.portfolio = {"cash": initial_capital, "stock": 0}
         self.portfolio_values = []
+        self.executor = OrderExecutor(paper=paper_trading) if paper_trading is not None else None
 
     def parse_action(self, agent_output):
         try:
@@ -27,29 +29,46 @@ class Backtester:
             return "hold", 0
 
     def execute_trade(self, action, quantity, current_price):
-        """Validate and execute trades based on portfolio constraints"""
-        if action == "buy" and quantity > 0:
-            cost = quantity * current_price
-            if cost <= self.portfolio["cash"]:
-                self.portfolio["stock"] += quantity
-                self.portfolio["cash"] -= cost
-                return quantity
-            else:
-                # Calculate maximum affordable quantity
-                max_quantity = self.portfolio["cash"] // current_price
-                if max_quantity > 0:
-                    self.portfolio["stock"] += max_quantity
-                    self.portfolio["cash"] -= max_quantity * current_price
-                    return max_quantity
+        """Execute trades using either paper trading or live trading."""
+        if self.executor:
+            # Use Alpaca for order execution
+            try:
+                order_result = self.executor.execute_order(self.ticker, quantity, action)
+                if order_result["status"] == "filled":
+                    if action == "buy":
+                        self.portfolio["stock"] += quantity
+                        self.portfolio["cash"] -= quantity * current_price
+                    else:  # sell
+                        self.portfolio["stock"] -= quantity
+                        self.portfolio["cash"] += quantity * current_price
+                    return quantity
                 return 0
-        elif action == "sell" and quantity > 0:
-            quantity = min(quantity, self.portfolio["stock"])
-            if quantity > 0:
-                self.portfolio["cash"] += quantity * current_price
-                self.portfolio["stock"] -= quantity
-                return quantity
+            except Exception as e:
+                print(f"Order execution failed: {str(e)}")
+                return 0
+        else:
+            # Use original paper trading logic
+            if action == "buy" and quantity > 0:
+                cost = quantity * current_price
+                if cost <= self.portfolio["cash"]:
+                    self.portfolio["stock"] += quantity
+                    self.portfolio["cash"] -= cost
+                    return quantity
+                else:
+                    max_quantity = self.portfolio["cash"] // current_price
+                    if max_quantity > 0:
+                        self.portfolio["stock"] += max_quantity
+                        self.portfolio["cash"] -= max_quantity * current_price
+                        return max_quantity
+                    return 0
+            elif action == "sell" and quantity > 0:
+                quantity = min(quantity, self.portfolio["stock"])
+                if quantity > 0:
+                    self.portfolio["cash"] += quantity * current_price
+                    self.portfolio["stock"] -= quantity
+                    return quantity
+                return 0
             return 0
-        return 0
 
     def run_backtest(self):
         dates = pd.date_range(self.start_date, self.end_date, freq="B")
@@ -125,17 +144,18 @@ class Backtester:
         print(f"Maximum Drawdown: {max_drawdown * 100:.2f}%")
 
         return performance_df
-    
+
 ### 4. Run the Backtest #####
 if __name__ == "__main__":
     import argparse
-    
+
     # Set up argument parser
     parser = argparse.ArgumentParser(description='Run backtesting simulation')
     parser.add_argument('--ticker', type=str, help='Stock ticker symbol (e.g., AAPL)')
     parser.add_argument('--end_date', type=str, default=datetime.now().strftime('%Y-%m-%d'), help='End date in YYYY-MM-DD format')
     parser.add_argument('--start_date', type=str, default=(datetime.now() - timedelta(days=90)).strftime('%Y-%m-%d'), help='Start date in YYYY-MM-DD format')
     parser.add_argument('--initial_capital', type=float, default=100000, help='Initial capital amount (default: 100000)')
+    parser.add_argument('--paper_trading', type=bool, default=True, help='Use paper trading mode (default: True)')
 
     args = parser.parse_args()
 
@@ -146,6 +166,7 @@ if __name__ == "__main__":
         start_date=args.start_date,
         end_date=args.end_date,
         initial_capital=args.initial_capital,
+        paper_trading=args.paper_trading,
     )
 
     # Run the backtesting process
