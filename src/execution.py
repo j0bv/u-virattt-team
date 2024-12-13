@@ -1,6 +1,4 @@
 import requests
-import websockets
-import json
 
 class ExecutionClient:
     def __init__(self, base_url="http://localhost:3000"):
@@ -17,13 +15,10 @@ class ExecutionClient:
         
     async def get_positions(self):
         response = requests.get(f"{self.base_url}/positions")
-        return response.json()import os
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
+        return response.json()
+
+import os
+
 from datetime import datetime
 
 class OrderExecutor:
