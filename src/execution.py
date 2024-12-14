@@ -23,28 +23,22 @@ from datetime import datetime
 
 class OrderExecutor:
     def __init__(self, paper=True):
-        """Initialize the OrderExecutor with Alpaca API credentials."""
-        self.api_key = os.environ.get("ALPACA_API_KEY")
-        self.api_secret = os.environ.get("ALPACA_API_SECRET")
+        """Initialize the OrderExecutor with SDK client."""
+        self.client = ExecutionClient()
         
-        if not self.api_key or not self.api_secret:
-            raise ValueError("Alpaca API credentials not found in environment variables")
-        
-        self.trading_client = TradingClient(self.api_key, self.api_secret, paper=paper)
-        self.data_client = StockHistoricalDataClient(self.api_key, self.api_secret)
-        
-    def get_account(self):
+    async def get_account(self):
         """Get account information."""
-        return self.trading_client.get_account()
+        return await self.client.get_positions()
     
-    def get_position(self, symbol):
+    async def get_position(self, symbol):
         """Get position information for a specific symbol."""
         try:
-            return self.trading_client.get_open_position(symbol)
+            positions = await self.client.get_positions()
+            return next((pos for pos in positions if pos["symbol"] == symbol), None)
         except Exception:
             return None
             
-    def execute_order(self, symbol, quantity, side):
+    async def execute_order(self, symbol, quantity, side):
         """Execute a market order."""
         # Validate inputs
         if not isinstance(quantity, int) or quantity <= 0:
@@ -52,40 +46,20 @@ class OrderExecutor:
         if side not in ["buy", "sell"]:
             raise ValueError("Side must be either 'buy' or 'sell'")
             
-        # Convert side to Alpaca enum
-        order_side = OrderSide.BUY if side == "buy" else OrderSide.SELL
-        
-        # Create order request
-        order_request = MarketOrderRequest(
-            symbol=symbol,
-            qty=quantity,
-            side=order_side,
-            time_in_force=TimeInForce.DAY
-        )
-        
-        # Submit order
+        # Submit order through SDK client
         try:
-            order = self.trading_client.submit_order(order_request)
+            order = await self.client.execute_trade(
+                action=side,
+                symbol=symbol,
+                amount=quantity,
+                leverage=1  # Default leverage
+            )
             return {
-                "order_id": order.id,
-                "symbol": order.symbol,
+                "order_id": order.get("id"),
+                "symbol": symbol,
                 "side": side,
                 "quantity": quantity,
-                "status": order.status
+                "status": order.get("status", "filled")
             }
         except Exception as e:
             raise Exception(f"Order execution failed: {str(e)}")
-            
-    def get_order_status(self, order_id):
-        """Get the status of a specific order."""
-        return self.trading_client.get_order_by_id(order_id)
-        
-    def get_historical_data(self, symbol, start_date, end_date):
-        """Get historical price data."""
-        request = StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=TimeFrame.Day,
-            start=datetime.strptime(start_date, "%Y-%m-%d"),
-            end=datetime.strptime(end_date, "%Y-%m-%d")
-        )
-        return self.data_client.get_stock_bars(request)

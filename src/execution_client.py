@@ -1,245 +1,253 @@
-import asyncio
+import os
 import json
-import websockets
-import requests
+import asyncio
+import aiohttp
+from typing import Dict, Any, Optional
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Tuple
-from enum import Enum
-from position_manager import PositionManager, TrailingStop, PositionSize
-
-class TradeAction(Enum):
-    LONG = "LONG"
-    SHORT = "SHORT"
-    CLOSE = "CLOSE"
+from decimal import Decimal
 
 @dataclass
-class Position:
+class TrailingStop:
     symbol: str
-    size: float
-    leverage: float
-    entry_price: float
-    liquidation_price: float
-    unrealized_pnl: float
-    side: str
-
-@dataclass
-class OrderBook:
-    symbol: str
-    bids: List[Tuple[float, float]]  # List of (price, size)
-    asks: List[Tuple[float, float]]  # List of (price, size)
+    trail_percent: float
+    activation_price: Optional[float]
+    current_stop: float
+    is_active: bool
+    side: str  # 'long' or 'short'
 
 class ExecutionClient:
-    def __init__(self, base_url="http://localhost:3000"):
+    def __init__(self, base_url: str = "http://localhost:3000", network: str = None):
+        """Initialize the Gains Trade execution client with trailing stop support."""
         self.base_url = base_url
-        self.ws_url = f"ws://{base_url.split('://')[-1]}/ws"
-        self.ws = None
-        self.callback = None
-        self.position_manager = PositionManager()
+        self.network = network or os.getenv("NETWORK", "arbitrum")
+        self.trailing_stops: Dict[str, TrailingStop] = {}
         self._price_update_task = None
+        self._stop_price_updates = asyncio.Event()
         
-    async def connect(self, callback=None):
-        """Connect to WebSocket and set up callback for trade updates"""
-        self.callback = callback
-        self.ws = await websockets.connect(self.ws_url)
-        self._price_update_task = asyncio.create_task(self._price_updates())
-        asyncio.create_task(self._listen())
+    async def start_price_updates(self):
+        """Start the price update loop for trailing stops."""
+        if self._price_update_task is None:
+            self._stop_price_updates.clear()
+            self._price_update_task = asyncio.create_task(self._update_trailing_stops())
     
-    async def _price_updates(self):
-        """Periodically fetch prices and update trailing stops"""
-        while True:
+    async def stop_price_updates(self):
+        """Stop the price update loop."""
+        if self._price_update_task is not None:
+            self._stop_price_updates.set()
+            await self._price_update_task
+            self._price_update_task = None
+    
+    async def _update_trailing_stops(self):
+        """Update trailing stops based on current prices."""
+        while not self._stop_price_updates.is_set():
             try:
-                for symbol in self.position_manager.trailing_stops.keys():
-                    price = await self.get_price(symbol)
-                    stop_hit = self.position_manager.update_trailing_stop(symbol, price)
+                for symbol, stop in list(self.trailing_stops.items()):
+                    current_price = await self.get_market_price(symbol)
                     
-                    if stop_hit:
-                        # Execute trailing stop order
-                        await self.execute_trade(
-                            action=TradeAction.CLOSE,
-                            symbol=symbol,
-                            amount=0,  # Close entire position
-                            leverage=1
-                        )
-                        
-                        # Notify through callback
-                        if self.callback:
-                            await self.callback({
-                                "type": "TRAILING_STOP_HIT",
-                                "data": {
-                                    "symbol": symbol,
-                                    "price": price,
-                                    "stop": stop_hit
-                                }
-                            })
+                    # Check if trailing stop should be activated
+                    if not stop.is_active and stop.activation_price is not None:
+                        if (stop.side == 'long' and current_price >= stop.activation_price) or \
+                           (stop.side == 'short' and current_price <= stop.activation_price):
+                            stop.is_active = True
+                            stop.current_stop = self._calculate_stop_price(current_price, stop)
+                    
+                    # Update trailing stop if active
+                    if stop.is_active:
+                        new_stop = self._calculate_stop_price(current_price, stop)
+                        if stop.side == 'long':
+                            if new_stop > stop.current_stop:
+                                stop.current_stop = new_stop
+                            elif current_price <= stop.current_stop:
+                                await self._execute_stop(symbol, stop)
+                        else:  # short
+                            if new_stop < stop.current_stop:
+                                stop.current_stop = new_stop
+                            elif current_price >= stop.current_stop:
+                                await self._execute_stop(symbol, stop)
                 
             except Exception as e:
-                print(f"Error updating prices: {e}")
+                print(f"Error updating trailing stops: {e}")
             
             await asyncio.sleep(1)  # Update every second
     
-    async def _listen(self):
-        """Listen for WebSocket messages"""
+    def _calculate_stop_price(self, current_price: float, stop: TrailingStop) -> float:
+        """Calculate new stop price based on current price and trail percentage."""
+        if stop.side == 'long':
+            return current_price * (1 - stop.trail_percent / 100)
+        else:  # short
+            return current_price * (1 + stop.trail_percent / 100)
+    
+    async def _execute_stop(self, symbol: str, stop: TrailingStop):
+        """Execute the trailing stop order."""
         try:
-            while True:
-                message = await self.ws.recv()
-                data = json.loads(message)
-                if self.callback:
-                    await self.callback(data)
-        except websockets.exceptions.ConnectionClosed:
-            print("WebSocket connection closed")
+            position = await self.get_position(symbol)
+            if position:
+                await self.execute_trade(
+                    action="sell" if stop.side == 'long' else "buy",
+                    symbol=symbol,
+                    amount=abs(float(position.get("size", 0))),
+                    leverage=float(position.get("leverage", 1))
+                )
+            del self.trailing_stops[symbol]
+        except Exception as e:
+            print(f"Error executing stop: {e}")
     
-    async def execute_trade(self, action: TradeAction, symbol: str, amount: float, 
-                          leverage: float, stop_loss: Optional[float] = None, 
-                          take_profit: Optional[float] = None) -> dict:
-        """Execute a trade with optional stop loss and take profit"""
-        response = requests.post(f"{self.base_url}/execute", json={
-            "action": action.value,
-            "symbol": symbol,
-            "amount": amount,
-            "leverage": leverage,
-            "stopLoss": stop_loss,
-            "takeProfit": take_profit
-        })
-        return response.json()
-    
-    async def execute_trade_with_risk(self, 
-                                    action: TradeAction,
-                                    symbol: str,
-                                    risk_percent: float,
-                                    entry_price: float,
-                                    stop_loss: float,
-                                    account_value: float,
-                                    trail_percent: Optional[float] = None,
-                                    activation_price: Optional[float] = None,
-                                    max_leverage: float = 5.0) -> dict:
-        """
-        Execute a trade with position sizing and optional trailing stop
+    async def set_trailing_stop(self, symbol: str, trail_percent: float, side: str, 
+                              activation_offset: Optional[float] = None):
+        """Set a trailing stop for a position."""
+        current_price = await self.get_market_price(symbol)
         
-        Args:
-            action: Trade action (LONG/SHORT)
-            symbol: Trading pair symbol
-            risk_percent: Percentage of account to risk
-            entry_price: Intended entry price
-            stop_loss: Initial stop loss price
-            account_value: Current account value
-            trail_percent: Optional trailing stop percentage
-            activation_price: Optional price to activate trailing stop
-            max_leverage: Maximum allowed leverage
-        """
-        # Calculate position size
-        position = self.position_manager.calculate_position_size(
+        activation_price = None
+        if activation_offset is not None:
+            offset_multiplier = 1 + (activation_offset / 100)
+            activation_price = current_price * offset_multiplier if side == 'long' else current_price / offset_multiplier
+        
+        self.trailing_stops[symbol] = TrailingStop(
             symbol=symbol,
-            account_value=account_value,
-            risk_percent=risk_percent,
-            entry_price=entry_price,
-            stop_loss=stop_loss,
-            max_leverage=max_leverage
+            trail_percent=trail_percent,
+            activation_price=activation_price,
+            current_stop=self._calculate_stop_price(current_price, TrailingStop(
+                symbol=symbol, trail_percent=trail_percent, activation_price=None,
+                current_stop=0, is_active=True, side=side
+            )),
+            is_active=activation_price is None,
+            side=side
         )
         
-        # Execute the trade
-        result = await self.execute_trade(
-            action=action,
-            symbol=symbol,
-            amount=position.position_size,
-            leverage=position.leverage,
-            stop_loss=stop_loss
-        )
-        
-        # Set up trailing stop if requested
-        if trail_percent is not None:
-            self.position_manager.set_trailing_stop(
-                symbol=symbol,
-                trail_percent=trail_percent,
-                current_price=entry_price,
-                activation_price=activation_price
-            )
-        
-        return {
-            "trade_result": result,
-            "position_size": position,
-            "trailing_stop": self.position_manager.get_trailing_stop(symbol)
-        }
-    
-    async def update_trailing_stop(self, 
-                                 symbol: str,
-                                 trail_percent: Optional[float] = None,
-                                 activation_price: Optional[float] = None):
-        """Update trailing stop parameters for a position"""
-        current_price = await self.get_price(symbol)
-        
-        if trail_percent is not None:
-            self.position_manager.set_trailing_stop(
-                symbol=symbol,
-                trail_percent=trail_percent,
-                current_price=current_price,
-                activation_price=activation_price
-            )
-        
-        return self.position_manager.get_trailing_stop(symbol)
+        await self.start_price_updates()
     
     async def remove_trailing_stop(self, symbol: str):
-        """Remove trailing stop for a position"""
-        self.position_manager.remove_trailing_stop(symbol)
+        """Remove trailing stop for a symbol."""
+        if symbol in self.trailing_stops:
+            del self.trailing_stops[symbol]
+            
+        if not self.trailing_stops:
+            await self.stop_price_updates()
     
-    async def get_positions(self) -> List[Position]:
-        """Get current positions"""
-        response = requests.get(f"{self.base_url}/positions")
-        data = response.json()
-        return [Position(**pos) for pos in data.get("positions", [])]
+    async def execute_trade(self, action: str, symbol: str, amount: float, leverage: int = 1,
+                          trailing_stop_percent: Optional[float] = None,
+                          trailing_stop_activation_offset: Optional[float] = None) -> Dict[str, Any]:
+        """Execute a trade on Gains Trade with optional trailing stop."""
+        async with aiohttp.ClientSession() as session:
+            try:
+                payload = {
+                    "action": action,
+                    "symbol": symbol,
+                    "amount": amount,
+                    "leverage": leverage,
+                    "network": self.network
+                }
+                
+                async with session.post(f"{self.base_url}/execute", json=payload) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        
+                        # Set trailing stop if requested
+                        if trailing_stop_percent is not None and result.get("status") == "filled":
+                            await self.set_trailing_stop(
+                                symbol=symbol,
+                                trail_percent=trailing_stop_percent,
+                                side="long" if action == "buy" else "short",
+                                activation_offset=trailing_stop_activation_offset
+                            )
+                        
+                        return result
+                    else:
+                        error_text = await response.text()
+                        raise Exception(f"Trade execution failed: {error_text}")
+            except Exception as e:
+                raise Exception(f"Failed to execute trade: {str(e)}")
     
-    async def get_orderbook(self, symbol: str) -> OrderBook:
-        """Get order book for a symbol"""
-        response = requests.get(f"{self.base_url}/orderbook/{symbol}")
-        data = response.json()["orderBook"]
-        return OrderBook(
-            symbol=data["symbol"],
-            bids=data["bids"],
-            asks=data["asks"]
-        )
+    async def get_market_price(self, symbol: str) -> float:
+        """Get current market price for a symbol."""
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{self.base_url}/market/{symbol}/price") as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return float(data["price"])
+                else:
+                    raise Exception("Failed to get market price")
     
-    async def get_price(self, symbol: str) -> float:
-        """Get current price for a symbol"""
-        response = requests.get(f"{self.base_url}/price/{symbol}")
-        return response.json()["price"]
+    async def get_positions(self) -> Dict[str, Any]:
+        """Get current open positions."""
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(f"{self.base_url}/positions", params={"network": self.network}) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    else:
+                        error_text = await response.text()
+                        raise Exception(f"Failed to get positions: {error_text}")
+            except Exception as e:
+                raise Exception(f"Failed to get positions: {str(e)}")
     
-    async def close(self):
-        """Close WebSocket connection and cleanup"""
-        if self._price_update_task:
-            self._price_update_task.cancel()
-        if self.ws:
-            await self.ws.close()
+    async def get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Get position for a specific symbol."""
+        positions = await self.get_positions()
+        return next((pos for pos in positions.get("positions", []) 
+                    if pos.get("symbol") == symbol), None)
+    
+    async def get_market_info(self, symbol: str) -> Dict[str, Any]:
+        """Get market information for a symbol."""
+        async with aiohttp.ClientSession() as session:
+            try:
+                params = {"network": self.network}
+                async with session.get(f"{self.base_url}/market/{symbol}", params=params) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    else:
+                        error_text = await response.text()
+                        raise Exception(f"Failed to get market info: {error_text}")
+            except Exception as e:
+                raise Exception(f"Failed to get market info: {str(e)}")
+    
+    async def get_account(self) -> Dict[str, Any]:
+        """Get account information including balances."""
+        async with aiohttp.ClientSession() as session:
+            try:
+                params = {"network": self.network}
+                async with session.get(f"{self.base_url}/account", params=params) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    else:
+                        error_text = await response.text()
+                        raise Exception(f"Failed to get account info: {error_text}")
+            except Exception as e:
+                raise Exception(f"Failed to get account info: {str(e)}")
 
 # Example usage:
-async def handle_updates(update):
-    """Handle real-time updates from the execution service"""
-    if update["type"] == "TRAILING_STOP_HIT":
-        print(f"Trailing stop hit: {update['data']}")
-    elif update["type"] == "EXECUTION":
-        print(f"Trade executed: {update['data']}")
-    elif update["type"] == "POSITION_UPDATE":
-        print(f"Position updated: {update['data']}")
-    elif update["type"] == "ERROR":
-        print(f"Error: {update['data']['message']}")
-
 async def main():
-    client = ExecutionClient()
-    await client.connect(callback=handle_updates)
+    # Initialize client with specific network
+    client = ExecutionClient(network="polygon")  # or "arbitrum"
     
-    # Example trade with risk management and trailing stop
-    result = await client.execute_trade_with_risk(
-        action=TradeAction.LONG,
-        symbol="ETH-USD",
-        risk_percent=0.01,  # Risk 1% of account
-        entry_price=2000,
-        stop_loss=1900,
-        account_value=100000,
-        trail_percent=0.02,  # 2% trailing stop
-        activation_price=2100  # Activate trailing stop at $2100
+    # Example trade execution with trailing stop
+    result = await client.execute_trade(
+        action="buy",
+        symbol="BTC/USD",
+        amount=1000,
+        leverage=2,
+        trailing_stop_percent=2.0,  # 2% trailing stop
+        trailing_stop_activation_offset=1.0  # Activate when price moves 1% in profit
     )
     print(f"Trade result: {result}")
     
-    await asyncio.sleep(60)  # Let trailing stop monitor run
-    await client.close()
+    # Get current positions
+    positions = await client.get_positions()
+    print(f"Positions: {positions}")
+    
+    # Get market information
+    market_info = await client.get_market_info("BTC/USD")
+    print(f"Market info: {market_info}")
+    
+    # Get account information
+    account_info = await client.get_account()
+    print(f"Account info: {account_info}")
+    
+    # Wait for some time to see trailing stop in action
+    await asyncio.sleep(60)
+    
+    # Clean up
+    await client.stop_price_updates()
 
 if __name__ == "__main__":
     asyncio.run(main())
